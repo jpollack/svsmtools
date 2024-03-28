@@ -71,6 +71,9 @@ int main (int argc, char **argv, char **envp)
 	if ((ret < 0) && (errno == EAGAIN)) {
 	    continue;
 	}
+	if (ret == 0) {
+	    break;
+	}
 	dieunless (ret != -1);
 	nbytes += ret;
     }
