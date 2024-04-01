@@ -38,7 +38,6 @@ using namespace std;
 struct mydata
 {
     unordered_map<string,pair<int, struct shmid_ds>> segs;
-    unordered_map<string, string> tmps;
     unordered_map<string, unique_ptr<struct stat>> filstats;
     void init (void);
 };
@@ -51,7 +50,6 @@ void mydata::init (void)
     dieunless (maxShmid >= 0);
 
     this->segs.clear ();
-    this->tmps.clear ();
     this->filstats.clear ();
 
     for (int ii=0; ii<=maxShmid; ii++) {
@@ -78,7 +76,6 @@ void mydata::init (void)
 
 static int do_getattr (const char *path, struct stat *st, struct fuse_file_info *fi)
 {
-
     int ret = -1;
 
     struct fuse_context *ctx = fuse_get_context ();
@@ -101,7 +98,7 @@ static int do_getattr (const char *path, struct stat *st, struct fuse_file_info 
     } else {
 	ret = -ENOENT;
     }
-    
+
     fprintf (stderr, "\tGETATTR(%s) -> %d\n", path, ret);
 
     return ret;
@@ -121,41 +118,69 @@ static void do_destroy (void *udata)
 
 static int do_truncate (const char *path, off_t size, struct fuse_file_info *fi)
 {
-   fprintf (stderr, "\tTRUNCATE(%s,%d)\n", path, size);
+    struct fuse_context *ctx = fuse_get_context ();
+    mydata *that = (mydata *) ctx->private_data;
 
-   return 0;
+    fprintf (stderr, "\tTRUNCATE(%s,%d)\n", path, size);
+
+    if (that->segs.count (path+1)) {  // Can't overwrite
+	return -EPERM;
+    }
+
+    if ((path[1] != '0') || (path[2] != 'x')) { // Don't allow creating non-hex
+	return -ENOENT;
+    }
+
+    key_t key0 = std::stoul (string (path+1), nullptr, 16);
+    char buf[16];
+    snprintf (buf, 16, "0x%08x", key0);
+
+    if (strcmp (buf, path+1)) {
+	return -ENOENT;
+    }
+
+    int shmid = shmget (key0, size, IPC_CREAT | IPC_EXCL | 0666);
+    that->init ();
+    return 0;
 }
 
+static int do_unlink (const char *path)
+{
+    struct fuse_context *ctx = fuse_get_context ();
+    mydata *that = (mydata *) ctx->private_data;
+
+    if (!that->segs.count (path+1)) {
+	return -EBADF;
+    }
+
+    int shmid = that->segs[path+1].first;
+    int ret = shmctl (shmid, IPC_RMID, nullptr);
+    dieunless (ret == 0);
+    that->segs.erase (path + 1);
+    that->filstats.erase (path + 1);
+    return 0;
+}
 
 static int do_write (const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
-   fprintf (stderr, "\tWRITE(%s,%d,%d)\n", path, offset, size);
-
-   return 0;
-}
-
-static int do_create (const char *path, mode_t mode, struct fuse_file_info *fi)
-{
-    fprintf (stderr, "\tCREATE(%s,%d)\n", path, mode);
-
     struct fuse_context *ctx = fuse_get_context ();
     mydata *that = (mydata *) ctx->private_data;
-    
-    if (that->filstats.count (path+1)) {
-	return -ENOENT;
+
+    if (!that->segs.count (path+1)) {
+	return -EBADF;
     }
-    
-    auto p = make_unique<struct stat>();
-    memset (p.get (), 0, sizeof(struct stat));
 
-    p->st_uid = getuid ();
-    p->st_gid = getgid ();
-    p->st_mode = S_IFREG | mode;
-    p->st_nlink = 1;
-    p->st_size = 0;
+    int shmid = that->segs[path+1].first;
+    size_t shmsz = that->segs[path+1].second.shm_segsz;
+    char *pbase{nullptr};
 
-    that->filstats[string (path+1)] = move (p);
-    return 0;
+    dieunless ((char *)-1 != (pbase = (char *)shmat (shmid, nullptr, 0)));
+    if ((shmsz - offset) < size) {
+	size = shmsz - offset;
+    }
+    memcpy (pbase + offset, buf, size);
+    shmdt (pbase);
+    return size;
 }
 
 static int do_readdir( const char *path, void *buffer, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi, enum fuse_readdir_flags fl)
@@ -163,17 +188,17 @@ static int do_readdir( const char *path, void *buffer, fuse_fill_dir_t filler, o
     if (strcmp (path, "/")) {
 	return -ENOENT;
     }
-    
+
     struct fuse_context *ctx = fuse_get_context ();
     mydata *that = (mydata *) ctx->private_data;
 
     filler (buffer, ".", NULL, 0, (fuse_fill_dir_flags) 0);
     filler (buffer, "..", NULL, 0, (fuse_fill_dir_flags) 0);
-    
+
     for (const auto& [k, v] : that->filstats) {
 	filler (buffer, k.c_str (), NULL, 0, (fuse_fill_dir_flags) 0);
     }
-    
+
     return 0;
 }
 
@@ -200,13 +225,13 @@ static int do_read( const char *path, char *buffer, size_t size, off_t offset, s
 
 static struct fuse_operations operations = {
     .getattr	= do_getattr,
+    .unlink	= do_unlink,
     .truncate	= do_truncate,
     .read	= do_read,
     .write	= do_write,
     .readdir	= do_readdir,
     .init	= do_init,
     .destroy	= do_destroy,
-    .create	= do_create
 };
 
 int main (int argc, char **argv, char **envp)
