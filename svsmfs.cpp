@@ -116,6 +116,7 @@ static void do_destroy (void *udata)
     (void) udata;
 }
 
+
 static int do_truncate (const char *path, off_t size, struct fuse_file_info *fi)
 {
     struct fuse_context *ctx = fuse_get_context ();
@@ -127,21 +128,37 @@ static int do_truncate (const char *path, off_t size, struct fuse_file_info *fi)
 	return -EPERM;
     }
 
-    if ((path[1] != '0') || (path[2] != 'x')) { // Don't allow creating non-hex
+    if (!that->filstats.count (path+1)) { // Create wasn't called.
 	return -ENOENT;
     }
 
     key_t key0 = std::stoul (string (path+1), nullptr, 16);
-    char buf[16];
-    snprintf (buf, 16, "0x%08x", key0);
+    int shmid = shmget (key0, size, IPC_CREAT | IPC_EXCL | 0666);
 
-    if (strcmp (buf, path+1)) {
-	return -ENOENT;
+    struct shmid_ds seg0;
+    dieunless (shmctl (shmid, IPC_STAT, &seg0) == 0);
+
+    that->segs[string (path+1)] = {shmid, seg0};
+
+    const auto& p = that->filstats[string (path+1)];
+    p->st_uid = seg0.shm_perm.uid;
+    p->st_gid = seg0.shm_perm.gid;
+    p->st_mode = S_IFREG | 0644;
+    p->st_nlink = 1;
+    p->st_size = seg0.shm_segsz;
+
+    return 0;
+}
+static int do_fallocate (const char *path, int mode, off_t offset, off_t length, struct fuse_file_info *fi)
+{
+    struct fuse_context *ctx = fuse_get_context ();
+    mydata *that = (mydata *) ctx->private_data;
+
+    if (mode != 0) {
+	return -ENOSYS;
     }
 
-    int shmid = shmget (key0, size, IPC_CREAT | IPC_EXCL | 0666);
-    that->init ();
-    return 0;
+    return do_truncate (path, offset + length, fi);
 }
 
 static int do_unlink (const char *path)
@@ -149,15 +166,17 @@ static int do_unlink (const char *path)
     struct fuse_context *ctx = fuse_get_context ();
     mydata *that = (mydata *) ctx->private_data;
 
-    if (!that->segs.count (path+1)) {
-	return -EBADF;
+    if (that->filstats.count (path + 1)) {
+	that->filstats.erase (path + 1);
     }
 
-    int shmid = that->segs[path+1].first;
-    int ret = shmctl (shmid, IPC_RMID, nullptr);
-    dieunless (ret == 0);
-    that->segs.erase (path + 1);
-    that->filstats.erase (path + 1);
+    if (that->segs.count (path+1)) {
+	dieunless (0 == shmctl (that->segs[path+1].first, IPC_RMID, nullptr));
+	that->segs.erase (path + 1);
+    } else {
+	return -ENOENT;
+    }
+
     return 0;
 }
 
@@ -167,7 +186,7 @@ static int do_write (const char *path, const char *buf, size_t size, off_t offse
     mydata *that = (mydata *) ctx->private_data;
 
     if (!that->segs.count (path+1)) {
-	return -EBADF;
+	return -ENOENT;
     }
 
     int shmid = that->segs[path+1].first;
@@ -181,6 +200,36 @@ static int do_write (const char *path, const char *buf, size_t size, off_t offse
     memcpy (pbase + offset, buf, size);
     shmdt (pbase);
     return size;
+}
+
+static int do_create (const char *path, mode_t mode, struct fuse_file_info *fi)
+{
+    struct fuse_context *ctx = fuse_get_context ();
+    mydata *that = (mydata *) ctx->private_data;
+
+    if (that->filstats.count (path+1)) {
+	return -EPERM;  // Can't overwrite
+    }
+
+    if ((path[1] != '0') || (path[2] != 'x')) { // Don't allow creating non-hex
+	return -EPERM;
+    }
+
+    key_t key0 = std::stoul (string (path+1), nullptr, 16);
+    char buf[16];
+    snprintf (buf, 16, "0x%08x", key0);
+
+    if (strcmp (buf, path+1)) {
+	return -EPERM;
+    }
+
+    auto p = make_unique<struct stat>();
+    memset (p.get (), 0, sizeof(struct stat));
+    p->st_mode = S_IFREG | mode;
+    p->st_nlink = 1;
+    that->filstats[string (path+1)] = move (p);
+
+    return 0;
 }
 
 static int do_readdir( const char *path, void *buffer, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi, enum fuse_readdir_flags fl)
@@ -232,6 +281,8 @@ static struct fuse_operations operations = {
     .readdir	= do_readdir,
     .init	= do_init,
     .destroy	= do_destroy,
+    .create	= do_create,
+    .fallocate	= do_fallocate
 };
 
 int main (int argc, char **argv, char **envp)
