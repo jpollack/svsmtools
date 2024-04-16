@@ -99,8 +99,6 @@ static int do_getattr (const char *path, struct stat *st, struct fuse_file_info 
 	ret = -ENOENT;
     }
 
-    fprintf (stderr, "\tGETATTR(%s) -> %d\n", path, ret);
-
     return ret;
 }
 
@@ -121,8 +119,6 @@ static int do_truncate (const char *path, off_t size, struct fuse_file_info *fi)
 {
     struct fuse_context *ctx = fuse_get_context ();
     mydata *that = (mydata *) ctx->private_data;
-
-    fprintf (stderr, "\tTRUNCATE(%s,%d)\n", path, size);
 
     if (that->segs.count (path+1)) {  // Can't overwrite
 	return -EPERM;
@@ -166,6 +162,10 @@ static int do_unlink (const char *path)
     struct fuse_context *ctx = fuse_get_context ();
     mydata *that = (mydata *) ctx->private_data;
 
+    if (!that->filstats.count (path+1) && !that->segs.count (path+1)) {
+	return -ENOENT;
+    }
+
     if (that->filstats.count (path + 1)) {
 	that->filstats.erase (path + 1);
     }
@@ -173,8 +173,6 @@ static int do_unlink (const char *path)
     if (that->segs.count (path+1)) {
 	dieunless (0 == shmctl (that->segs[path+1].first, IPC_RMID, nullptr));
 	that->segs.erase (path + 1);
-    } else {
-	return -ENOENT;
     }
 
     return 0;
@@ -245,7 +243,7 @@ static int do_readdir( const char *path, void *buffer, fuse_fill_dir_t filler, o
     filler (buffer, "..", NULL, 0, (fuse_fill_dir_flags) 0);
 
     for (const auto& [k, v] : that->filstats) {
-	filler (buffer, k.c_str (), NULL, 0, (fuse_fill_dir_flags) 0);
+	filler (buffer, k.c_str (), v.get (), 0, (fuse_fill_dir_flags) 0);
     }
 
     return 0;
@@ -282,7 +280,7 @@ static struct fuse_operations operations = {
     .init	= do_init,
     .destroy	= do_destroy,
     .create	= do_create,
-    .fallocate	= do_fallocate
+    .fallocate	= do_fallocate,
 };
 
 int main (int argc, char **argv, char **envp)
